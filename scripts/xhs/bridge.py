@@ -213,9 +213,18 @@ class BridgePage:
     def set_file_input(self, selector: str, files: list[str]) -> None:
         """通过 chrome.debugger + DOM.setFileInputFiles 上传本地文件。
         传递绝对路径给扩展，由扩展调用 CDP 完成上传（与原 CDP 方式等价）。
+        当浏览器运行在 Windows host、CLI 运行在 WSL/Linux 时，将 Linux 路径
+        转换为 Windows Chrome 可读取的 \\wsl.localhost UNC 路径。
         """
-        # 统一转换为绝对路径（兼容 Windows 反斜杠）
-        abs_paths = [os.path.abspath(path) for path in files]
+        def to_browser_path(path: str) -> str:
+            abs_path = os.path.abspath(path)
+            if abs_path.startswith("/") and os.path.exists(abs_path):
+                # Windows Chrome cannot read /home/... directly. Use the WSL UNC path.
+                # This environment's distro name is Ubuntu (\\wsl.localhost\Ubuntu\...).
+                return "\\\\wsl.localhost\\Ubuntu" + abs_path.replace("/", "\\")
+            return abs_path
+
+        abs_paths = [to_browser_path(path) for path in files]
         self._call("set_file_input", {"selector": selector, "files": abs_paths})
 
     # ─── 截图 ────────────────────────────────────────────────────

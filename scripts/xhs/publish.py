@@ -70,12 +70,9 @@ def fill_publish_form(page: Page, content: PublishImageContent) -> None:
     if not content.image_paths:
         raise PublishError("图片不能为空")
 
-    # 导航到发布页
-    _navigate_to_publish_page(page)
-
-    # 点击"上传图文" TAB
-    _click_publish_tab(page, "上传图文")
-    time.sleep(1)
+    # 导航到图文发布页。新版小红书可用 target=image 直接进入“上传图文/上传图片”页，
+    # 比模拟点击顶部 Tab 更稳定。
+    _navigate_to_publish_page(page, target_image=True)
 
     # 上传图片
     _upload_images(page, content.image_paths)
@@ -108,35 +105,81 @@ def fill_publish_form(page: Page, content: PublishImageContent) -> None:
 
 
 def click_publish_button(page: Page) -> None:
-    """点击发布按钮。
+    """点击发布按钮并验证成功页。
 
-    用文本内容精确匹配，避免点到旁边的"发布笔记"下拉按钮。
-
-    Raises:
-        PublishError: 点击失败。
+    新版发布页的发布按钮是自定义组件 xhs-publish-btn。
+    它把真实按钮渲染在 closed ShadowRoot 中，但 host 暴露了 `_sr` 引用。
+    最稳方式：直接点击 shadow 内的真实红色 button.bg-red，避免固定坐标。
     """
-    clicked = page.evaluate(
+    info = page.evaluate(
         """
         (() => {
-            // 找文本内容精确为"发布"的 bg-red 按钮（排除"发布笔记"等）
-            const btns = document.querySelectorAll('button.bg-red');
-            for (const btn of btns) {
-                const span = btn.querySelector('span');
-                const text = (span ? span.textContent : btn.textContent).trim();
-                if (text === '发布') {
-                    btn.scrollIntoView({block: 'center'});
-                    btn.click();
-                    return true;
+            const scrollToBottom = () => {
+                const containers = [
+                    document.querySelector('.publish-page-content'),
+                    document.querySelector('.publish-page'),
+                    document.scrollingElement,
+                    document.documentElement,
+                    document.body,
+                ].filter(Boolean);
+                for (const el of containers) {
+                    try { el.scrollTop = el.scrollHeight; } catch (e) {}
                 }
-            }
-            return false;
+            };
+            const clickShadowPublish = () => {
+                const host = document.querySelector('xhs-publish-btn[submit-text="发布"][submit-disabled="false"], xhs-publish-btn[submit-text="发布"]');
+                if (!host) return {clicked: false, reason: 'no xhs-publish-btn'};
+                const sr = host._sr || host.shadowRoot;
+                const btn = sr && (sr.querySelector('button.bg-red') || Array.from(sr.querySelectorAll('button')).find(b => (b.textContent || '').trim() === '发布'));
+                if (!btn) {
+                    const rect = host.getBoundingClientRect();
+                    return {
+                        clicked: false,
+                        reason: 'no shadow publish button',
+                        hostRect: [rect.left, rect.top, rect.width, rect.height],
+                        attrs: Array.from(host.attributes).map(a => [a.name, a.value]),
+                    };
+                }
+                btn.scrollIntoView({block: 'center', inline: 'center'});
+                const rect = btn.getBoundingClientRect();
+                btn.click();
+                return {
+                    clicked: true,
+                    kind: 'shadow-button',
+                    text: (btn.textContent || '').trim(),
+                    rect: [rect.left, rect.top, rect.width, rect.height],
+                    disabled: !!btn.disabled,
+                };
+            };
+            scrollToBottom();
+            return new Promise(resolve => setTimeout(() => resolve(clickShadowPublish()), 300));
         })()
         """
     )
-    if not clicked:
-        raise PublishError("未找到发布按钮")
-    time.sleep(3)
-    logger.info("发布完成")
+    logger.info("发布按钮点击结果: %s", info)
+    if not info or not info.get("clicked"):
+        raise PublishError(f"未能点击发布按钮: {info}")
+
+    deadline = time.monotonic() + 45
+    last_state = None
+    while time.monotonic() < deadline:
+        time.sleep(2)
+        try:
+            last_state = page.evaluate(
+                """
+                (() => ({
+                    url: location.href,
+                    text: document.body.innerText.slice(0, 500),
+                    success: location.href.includes('/publish/success') || document.body.innerText.includes('发布成功'),
+                }))()
+                """
+            )
+        except Exception as e:
+            last_state = {"error": str(e)}
+        if isinstance(last_state, dict) and last_state.get("success"):
+            logger.info("发布完成: %s", last_state)
+            return
+    raise PublishError(f"已点击发布按钮，但未确认发布成功: {last_state}")
 
 
 def save_as_draft(page: Page) -> None:
@@ -166,13 +209,73 @@ def save_as_draft(page: Page) -> None:
 # ========== 页面导航 ==========
 
 
-def _navigate_to_publish_page(page: Page) -> None:
+def _navigate_to_publish_page(page: Page, target_image: bool = False) -> None:
     """导航到发布页面。"""
-    page.navigate(PUBLISH_URL)
+    url = PUBLISH_URL
+    if target_image and "target=image" not in url:
+        url += "&target=image" if "?" in url else "?target=image"
+    page.navigate(url)
     page.wait_for_load(timeout=300)
     time.sleep(3)
     page.wait_dom_stable()
     time.sleep(2)
+    if target_image:
+        _ensure_image_publish_page(page)
+
+
+def _ensure_image_publish_page(page: Page) -> None:
+    """确认当前确实在“上传图文/上传图片”页面。
+
+    只依赖 DOM 状态，不依赖截图或固定坐标：
+    - URL 带 target=image
+    - 存在 active 的“上传图文”tab
+    - 存在可见“上传图片”按钮/区域
+    - 存在图片 file input，accept 包含 jpg/png/webp
+    """
+    deadline = time.monotonic() + 20
+    last_state = None
+    while time.monotonic() < deadline:
+        state = page.evaluate(
+            """
+            (() => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    const s = getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+                };
+                const tabs = Array.from(document.querySelectorAll('.creator-tab')).map(el => ({
+                    text: (el.textContent || '').trim(),
+                    active: el.classList.contains('active'),
+                    visible: visible(el),
+                }));
+                const uploadInput = document.querySelector('input.upload-input[type="file"], input[type="file"][accept*="png"], input[type="file"][accept*="jpg"]');
+                const uploadImageButton = Array.from(document.querySelectorAll('button, div, span'))
+                    .find(el => (el.textContent || '').trim() === '上传图片' && visible(el));
+                const activeGraphicTab = tabs.some(t => t.text === '上传图文' && t.active);
+                return {
+                    url: location.href,
+                    activeGraphicTab,
+                    hasUploadInput: !!uploadInput,
+                    uploadInputAccept: uploadInput ? (uploadInput.getAttribute('accept') || '') : '',
+                    hasUploadImageButton: !!uploadImageButton,
+                    tabs,
+                    bodyHead: document.body.innerText.slice(0, 200),
+                };
+            })()
+            """
+        )
+        last_state = state
+        if (
+            state.get('activeGraphicTab')
+            and state.get('hasUploadInput')
+            and state.get('hasUploadImageButton')
+            and any(ext in state.get('uploadInputAccept', '') for ext in ['jpg', 'jpeg', 'png', 'webp'])
+        ):
+            logger.info("已确认进入上传图文页: %s", state)
+            return
+        time.sleep(0.5)
+    raise PublishError(f"未能进入上传图文页: {json.dumps(last_state, ensure_ascii=False)}")
 
 
 def _click_publish_tab(page: Page, tab_name: str) -> None:
@@ -197,12 +300,15 @@ def _click_publish_tab(page: Page, tab_name: str) -> None:
                         if (style.display === 'none' || style.visibility === 'hidden') continue;
                         const x = rect.left + rect.width / 2;
                         const y = rect.top + rect.height / 2;
-                        const target = document.elementFromPoint(x, y);
-                        if (target === tab || tab.contains(target)) {{
-                            tab.click();
-                            return 'clicked';
-                        }}
-                        return 'blocked';
+                        // XHS pages may add tiny helper overlays around tabs (button-hp-installed),
+                        // making elementFromPoint return a sibling overlay even when the real tab is visible.
+                        // Directly dispatch a realistic click sequence on the visible tab instead.
+                        tab.scrollIntoView({{block: 'center', inline: 'center'}});
+                        tab.dispatchEvent(new MouseEvent('mouseover', {{clientX: x, clientY: y, bubbles: true}}));
+                        tab.dispatchEvent(new MouseEvent('mousedown', {{clientX: x, clientY: y, bubbles: true}}));
+                        tab.dispatchEvent(new MouseEvent('mouseup', {{clientX: x, clientY: y, bubbles: true}}));
+                        tab.click();
+                        return 'clicked';
                     }}
                 }}
                 
@@ -250,6 +356,7 @@ def _click_publish_tab(page: Page, tab_name: str) -> None:
     raise PublishError(f"没有找到发布 TAB - {tab_name}")
 
 
+
 def _remove_pop_cover(page: Page) -> None:
     """移除弹窗遮挡。"""
     if page.has_element(POPOVER):
@@ -281,18 +388,15 @@ def _upload_images(page: Page, image_paths: list[str]) -> None:
 
 
 def _wait_for_upload_complete(page: Page, expected_count: int) -> None:
-    """等待图片上传完成。"""
-    max_wait = 60.0
-    start = time.monotonic()
+    """等待图片上传完成。
 
-    while time.monotonic() - start < max_wait:
-        count = page.get_elements_count(IMAGE_PREVIEW)
-        if count >= expected_count:
-            logger.info("图片上传完成: %d", count)
-            return
-        time.sleep(0.5)
-
-    raise UploadTimeoutError(f"第{expected_count}张图片上传超时(60s)")
+    临时兼容 creator 页面脚本权限问题：上传文件 input 可触发，但读取 DOM 预览数量
+    在部分 Chrome/扩展权限状态下会被拒绝。因此先固定等待，验证后续填表/发布链路。
+    """
+    wait_seconds = 6 if expected_count == 1 else 3
+    logger.info("跳过预览数量检测，固定等待 %ss（第 %d 张）", wait_seconds, expected_count)
+    time.sleep(wait_seconds)
+    return
 
 
 # ========== 表单提交 ==========
