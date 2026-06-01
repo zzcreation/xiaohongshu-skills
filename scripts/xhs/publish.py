@@ -576,9 +576,14 @@ def _input_tags(page: Page, content_selector: str, tags: list[str]) -> None:
     )
     time.sleep(0.5)
 
-    for tag in tags:
-        tag = tag.lstrip("#")
-        _input_single_tag(page, content_selector, tag)
+    # 小红书新版 Tiptap 编辑器在连续点击多个“话题联想”时会出现焦点丢失：
+    # 日志看起来每个联想都点中了，但预览里实际只保留第一个话题。
+    # 因此只把第一个标签转成正式话题节点，后续标签用普通 hashtag 文本一次性追加，
+    # 这样预览和最终正文都能稳定显示完整标签列表。
+    first, *rest = [tag.lstrip("#") for tag in tags]
+    _input_single_tag(page, content_selector, first)
+    if rest:
+        _append_plain_tags(page, content_selector, rest)
 
     # 输入完所有 tags 后，回到正文最后一段（tags 输入前的最后一段）末尾，按下回车
     # 用 para_count_before 精确定位，避免 tags 输入后 Quill 自动新增空段导致偏移
@@ -635,6 +640,32 @@ def _input_single_tag(page: Page, content_selector: str, tag: str) -> None:
         page.type_text(" ", delay_ms=0)
 
     time.sleep(0.8)
+
+
+def _append_plain_tags(page: Page, content_selector: str, tags: list[str]) -> None:
+    """稳定追加多个普通 hashtag 文本。"""
+    text = " " + " ".join(f"#{tag.lstrip('#')}" for tag in tags)
+    escaped_selector = json.dumps(content_selector, ensure_ascii=False)
+    escaped_text = json.dumps(text, ensure_ascii=False)
+    page.evaluate(
+        f"""
+        (() => {{
+            const el = document.querySelector({escaped_selector});
+            if (!el) return;
+            el.focus();
+            const range = document.createRange();
+            range.selectNodeContents(el);
+            range.collapse(false);
+            const sel = window.getSelection();
+            sel.removeAllRanges();
+            sel.addRange(range);
+            document.execCommand('insertText', false, {escaped_text});
+            el.dispatchEvent(new InputEvent('input', {{bubbles: true, inputType: 'insertText', data: {escaped_text}}}));
+        }})()
+        """
+    )
+    logger.info("追加普通标签文本: %s", ", ".join(tags))
+    time.sleep(0.5)
 
 
 # ========== 定时发布 ==========
